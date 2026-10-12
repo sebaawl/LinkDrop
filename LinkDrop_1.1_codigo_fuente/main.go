@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,7 +29,7 @@ import (
 var webFiles embed.FS
 
 const appName = "LinkDrop"
-const appVersion = "1.1.0"
+const appVersion = "2.0.0"
 const ytDLPURL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 const ffmpegURL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 const ffmpegSmallURL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.7z"
@@ -38,25 +37,39 @@ const ffmpegSmallURL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essent
 var progressRX = regexp.MustCompile(`(?i)(\d+(?:[.,]\d+)?)\s*%`)
 
 type app struct {
-	mu            sync.Mutex
-	token         string
-	directory     string
-	outputDefault string
-	setupActive   bool
-	setupStatus   string
-	setupPercent  float64
-	installed     bool
-	jobActive     bool
-	jobStatus     string
-	jobPercent    float64
-	jobSpeed      string
-	jobETA        string
-	jobTitle      string
-	jobError      string
-	jobDone       bool
-	jobFile       string
-	logLines      []string
-	cancel        context.CancelFunc
+	mu                sync.Mutex
+	token             string
+	directory         string
+	outputDefault     string
+	setupActive       bool
+	setupStatus       string
+	setupPercent      float64
+	installed         bool
+	jobActive         bool
+	jobStatus         string
+	jobPercent        float64
+	jobSpeed          string
+	jobETA            string
+	jobTitle          string
+	jobError          string
+	jobDone           bool
+	jobFile           string
+	logLines          []string
+	cancel            context.CancelFunc
+	downloadDone      <-chan struct{}
+	quit              func()
+	theme             string
+	applyTheme        func(string) error
+	readClipboard     func() (string, error)
+	chooseFolder      func(string) (string, error)
+	queue             queueData
+	queueRunning      bool
+	queueStop         bool
+	queueCurrent      string
+	queueDone         <-chan struct{}
+	metadataJobs      chan queueItem
+	metadataCancel    context.CancelFunc
+	queueStorageError string
 }
 
 type status struct {
@@ -76,6 +89,8 @@ type status struct {
 	Logs           []string `json:"logs"`
 	DownloadFolder string   `json:"downloadFolder"`
 	Version        string   `json:"version"`
+	Theme          string   `json:"theme"`
+	QueueRunning   bool     `json:"queueRunning"`
 }
 
 type downloadRequest struct {
@@ -109,7 +124,10 @@ func main() {
 	home, _ := os.UserHomeDir()
 	defaultFolder := filepath.Join(home, "Downloads")
 	a := &app{token: hex.EncodeToString(tokenBytes), directory: dir, outputDefault: defaultFolder}
+	a.theme = loadTheme(a.settingsPath())
+	a.loadQueue()
 	a.installed = a.checkEngines()
+	a.startMetadataLookup()
 	if a.installed {
 		a.setupStatus = "Componentes listos"
 	} else {
@@ -123,21 +141,46 @@ func main() {
 	mux.HandleFunc("/api/download", a.apiDownload)
 	mux.HandleFunc("/api/cancel", a.apiCancel)
 	mux.HandleFunc("/api/open-folder", a.apiOpenFolder)
+	mux.HandleFunc("/api/browse-folder", a.apiBrowseFolder)
+	mux.HandleFunc("/api/clipboard", a.apiClipboard)
+	mux.HandleFunc("/api/theme", a.apiTheme)
 	mux.HandleFunc("/api/quit", a.apiQuit)
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
+	mux.HandleFunc("/api/youtube/search", a.apiYouTubeSearch)
+	mux.HandleFunc("/api/queue", a.apiQueue)
+	mux.HandleFunc("/api/queue/add", a.apiQueueAdd)
+	mux.HandleFunc("/api/queue/config", a.apiQueueConfig)
+	mux.HandleFunc("/api/queue/item", a.apiQueueItem)
+	mux.HandleFunc("/api/queue/control", a.apiQueueControl)
+	if err := runApplication(a, mux); err != nil {
+		showStartupError(err.Error())
+		os.Exit(1)
 	}
-	link := fmt.Sprintf("http://127.0.0.1:%d/?t=%s", listener.Addr().(*net.TCPAddr).Port, a.token)
-	go func() {
-		time.Sleep(250 * time.Millisecond)
-		if err := openBrowser(link); err != nil {
-			log.Printf("Open %s manually: %v", link, err)
+}
+
+func (a *app) stopDownload() {
+	if a.metadataCancel != nil {
+		a.metadataCancel()
+	}
+	a.mu.Lock()
+	a.queueStop = true
+	cancel, done, queueDone := a.cancel, a.downloadDone, a.queueDone
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// Allow CommandContext to terminate the external engine before the main
+	// function returns and the desktop process exits.
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
 		}
-	}()
-	log.Println("LinkDrop available at", link)
-	if err := http.Serve(listener, mux); err != nil {
-		log.Fatal(err)
+	}
+	if queueDone != nil {
+		select {
+		case <-queueDone:
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 
@@ -177,12 +220,11 @@ func (a *app) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "URL no válida", http.StatusForbidden)
 		return
 	}
-	b, err := webFiles.ReadFile("web/index.html")
+	html, err := a.pageHTML()
 	if err != nil {
 		http.Error(w, "UI no disponible", 500)
 		return
 	}
-	html := strings.ReplaceAll(string(b), "__TOKEN__", a.token)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'")
@@ -249,7 +291,7 @@ func (a *app) snapshot() status {
 	return status{Ready: a.installed, Installing: a.setupActive, SetupStatus: a.setupStatus, SetupPercent: a.setupPercent,
 		Downloading: a.jobActive, JobStatus: a.jobStatus, JobPercent: a.jobPercent, JobSpeed: a.jobSpeed,
 		JobETA: a.jobETA, JobTitle: a.jobTitle, JobError: a.jobError, JobDone: a.jobDone, JobFile: a.jobFile,
-		Logs: logs, DownloadFolder: a.outputDefault, Version: appVersion}
+		Logs: logs, DownloadFolder: a.outputDefault, Version: appVersion, Theme: a.theme, QueueRunning: a.queueRunning}
 }
 func (a *app) apiStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" || !a.authorized(r) {
@@ -284,7 +326,7 @@ func (a *app) apiSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
-	if a.setupActive || a.jobActive {
+	if a.setupActive || a.jobActive || a.queueRunning {
 		a.mu.Unlock()
 		sendError(w, 409, "Ya hay una operación en curso")
 		return
@@ -573,7 +615,7 @@ func (a *app) apiInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 100*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, a.ytDLPPath(), "--ignore-config", "--no-playlist", "--dump-single-json", "--skip-download", "--no-warnings", "--", request.URL)
+	cmd := exec.CommandContext(ctx, a.ytDLPPath(), "--ignore-config", "--encoding", "utf-8", "--no-playlist", "--dump-single-json", "--skip-download", "--no-warnings", "--", request.URL)
 	hideCmdWindow(cmd)
 	output, err := cmd.Output()
 	if err != nil {
@@ -630,57 +672,64 @@ func (a *app) apiDownload(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 400, "Datos inválidos")
 		return
 	}
+	if _, err := a.startDownload(req, false); err != nil {
+		sendError(w, 409, err.Error())
+		return
+	}
+	sendJSON(w, 202, map[string]string{"message": "Descarga iniciada"})
+}
+
+func (a *app) startDownload(req downloadRequest, fromQueue bool) (<-chan struct{}, error) {
 	req.URL = strings.TrimSpace(req.URL)
 	if err := validURL(req.URL); err != nil {
-		sendError(w, 400, err.Error())
-		return
+		return nil, err
 	}
 	args, err := makeArgs(req, a.directory)
 	if err != nil {
-		sendError(w, 400, err.Error())
-		return
+		return nil, err
 	}
 	folder := strings.TrimSpace(req.Folder)
 	if folder == "" {
 		folder = a.outputDefault
 	}
 	if !filepath.IsAbs(folder) {
-		sendError(w, 400, "Elige una ruta completa para guardar")
-		return
+		return nil, errors.New("Elige una ruta completa para guardar")
 	}
 	if err := os.MkdirAll(folder, 0755); err != nil {
-		sendError(w, 400, "No se puede crear la carpeta: "+err.Error())
-		return
+		return nil, fmt.Errorf("No se puede crear la carpeta: %w", err)
 	}
 	a.mu.Lock()
 	if !a.installed || a.setupActive {
 		a.mu.Unlock()
-		sendError(w, 409, "Primero prepara los componentes")
-		return
+		return nil, errors.New("Primero prepara los componentes")
 	}
-	if a.jobActive {
+	if a.jobActive || (a.queueRunning && !fromQueue) {
 		a.mu.Unlock()
-		sendError(w, 409, "Ya hay una descarga en curso")
-		return
+		return nil, errors.New("Ya hay una descarga o una cola en curso")
+	}
+	if fromQueue && a.queueStop {
+		a.mu.Unlock()
+		return nil, context.Canceled
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	a.cancel = cancel
+	a.downloadDone = done
 	a.jobActive = true
 	a.jobDone = false
 	a.jobPercent = 0
 	a.jobError = ""
 	a.jobFile = ""
-	a.jobStatus = "Conectando..."
+	a.jobStatus = "Conectando…"
 	a.jobSpeed = ""
 	a.jobETA = ""
 	a.jobTitle = ""
 	a.logLines = nil
 	a.mu.Unlock()
-	// Prevent one user's yt-dlp config from changing the app's behavior.
-	args = append([]string{"--ignore-config", "--no-playlist", "--no-overwrites", "--no-simulate", "--progress", "--newline", "--no-color", "--ffmpeg-location", a.ffmpegDir(), "--paths", folder, "--output", "%(title).180B [%(id)s].%(ext)s", "--progress-template", "download:LDPROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s", "--print", "after_move:ARCHIVO_FINAL:%(filepath)s"}, args...)
+	args = append([]string{"--ignore-config", "--encoding", "utf-8", "--no-playlist", "--no-overwrites", "--no-simulate", "--progress", "--newline", "--no-color", "--ffmpeg-location", a.ffmpegDir(), "--paths", folder, "--output", "%(title).180B [%(id)s].%(ext)s", "--progress-template", "download:LDPROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s", "--print", "before_dl:LINKDROP_TITLE:%(title)s", "--print", "after_move:ARCHIVO_FINAL:%(filepath)s"}, args...)
 	args = append(args, "--", req.URL)
-	go a.runDownload(ctx, cancel, args)
-	sendJSON(w, 202, map[string]string{"message": "Descarga iniciada"})
+	go func() { defer close(done); a.runDownload(ctx, cancel, args) }()
+	return done, nil
 }
 func makeArgs(r downloadRequest, engineDir string) ([]string, error) {
 	args := []string{}
@@ -757,13 +806,15 @@ func (a *app) updateProgress(line string) {
 			a.jobETA = strings.TrimSpace(values[2])
 		}
 		a.jobStatus = "Descargando..."
+	} else if strings.HasPrefix(line, "LINKDROP_TITLE:") {
+		a.jobTitle = strings.TrimPrefix(line, "LINKDROP_TITLE:")
 	} else if strings.HasPrefix(line, "ARCHIVO_FINAL:") {
 		a.jobFile = strings.TrimPrefix(line, "ARCHIVO_FINAL:")
 		a.jobPercent = 100
 		a.jobStatus = "Archivo guardado"
 	} else if strings.Contains(line, "[Merger]") || strings.Contains(line, "[ExtractAudio]") || strings.Contains(line, "[VideoConvertor]") || strings.Contains(line, "[VideoRemuxer]") {
 		a.jobStatus = "Procesando archivo con FFmpeg..."
-	} else if strings.Contains(line, "[download] Destination:") {
+	} else if a.jobTitle == "" && strings.Contains(line, "[download] Destination:") {
 		a.jobTitle = strings.TrimSpace(strings.SplitN(line, "Destination:", 2)[1])
 	}
 }
@@ -807,6 +858,13 @@ func (a *app) runDownload(ctx context.Context, cancel context.CancelFunc, args [
 		a.jobDone = false
 		return
 	}
+	info, fileErr := os.Stat(a.jobFile)
+	if a.jobFile == "" || fileErr != nil || info.IsDir() || info.Size() == 0 {
+		a.jobDone = false
+		a.jobStatus = "No se pudo confirmar el archivo"
+		a.jobError = "El motor terminó sin guardar un archivo válido. Revisa el registro."
+		return
+	}
 	a.jobDone = true
 	a.jobPercent = 100
 	a.jobStatus = "¡Descarga completada!"
@@ -816,6 +874,9 @@ func (a *app) apiCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
+	if a.queueRunning {
+		a.queueStop = true
+	}
 	cancel := a.cancel
 	a.mu.Unlock()
 	if cancel != nil {
@@ -859,12 +920,19 @@ func (a *app) apiQuit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
-	busy := a.jobActive || a.setupActive
+	busy := a.jobActive || a.setupActive || a.queueRunning
 	a.mu.Unlock()
 	if busy {
 		sendError(w, 409, "Espera a que termine el proceso o cancela la descarga")
 		return
 	}
 	sendJSON(w, 200, map[string]string{"message": "Cerrando"})
-	go func() { time.Sleep(200 * time.Millisecond); os.Exit(0) }()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		if a.quit != nil {
+			a.quit()
+		} else {
+			os.Exit(0)
+		}
+	}()
 }
